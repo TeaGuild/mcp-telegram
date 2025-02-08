@@ -220,58 +220,64 @@ def parse_chat_id(chat: str) -> str | int:
     except (ValueError, AttributeError):
         return chat
 
-def serialize_message(message: Message) -> Dict[str, Any]:
-    """Convert a Telegram message to a clean JSON structure"""
+def ensure_unicode(text: str | None) -> str:
+    """Ensure text is properly encoded as Unicode."""
+    if text is None:
+        return ""
+    # Handle potential surrogate pairs and ensure proper UTF-8 encoding
+    return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+
+def serialize_message(msg: Message) -> Dict[str, Any]:
+    """Convert a Telegram message to a minimal JSON structure with proper Unicode handling."""
     data = {
-        "id": message.id,
-        "date": message.date.isoformat() if message.date else None,
-        "edit_date": message.edit_date.isoformat() if message.edit_date else None,
-        "text": message.text or message.caption,
-        "from_user": {
-            "id": message.from_user.id if message.from_user else None,
-            "name": message.from_user.first_name if message.from_user else None,
-            "username": message.from_user.username if message.from_user else None
-        } if message.from_user else None,
+        "id": msg.id,
+        "date": msg.date.isoformat() if msg.date else None,
+        # Properly handle text with potential Unicode characters
+        "text": ensure_unicode(msg.text or msg.caption),
+        "from": {
+            "id": msg.from_user.id,
+            "username": ensure_unicode(msg.from_user.username),
+            "name": ensure_unicode(msg.from_user.first_name)
+        } if msg.from_user else None,
         "chat": {
-            "id": message.chat.id,
-            "title": message.chat.title,
-            "username": message.chat.username
-        } if message.chat else None,
-        "reply_to_message_id": parse_message_id(message.reply_to_message_id),
-        "forward_from": message.forward_from.id if message.forward_from else None,
-        "views": getattr(message, 'views', None),
-        "media": None
+            "id": msg.chat.id,
+            "title": ensure_unicode(msg.chat.title or msg.chat.first_name),
+            "type": str(msg.chat.type)
+        }
     }
+
+    # Add optional fields only if present, ensuring Unicode for text fields
+    if msg.edit_date:
+        data["edited_at"] = msg.edit_date.isoformat()
+    if msg.reply_to_message_id:
+        data["reply_to"] = msg.reply_to_message_id
+    if msg.forward_from:
+        data["forwarded_from"] = {
+            "id": msg.forward_from.id,
+            "name": ensure_unicode(msg.forward_from.first_name)
+        }
+    if msg.views:
+        data["views"] = msg.views
     
-    # Add media information if present
-    if message.media:
-        if message.document:
+    # Add media info if present, ensuring Unicode for text fields
+    if msg.media:
+        if msg.document:
             data["media"] = {
                 "type": "document",
-                "mime_type": message.document.mime_type,
-                "file_size": message.document.file_size,
-                "filename": message.document.file_name
+                "name": ensure_unicode(msg.document.file_name),
+                "size": msg.document.file_size
             }
-        elif message.photo:
-            # Photos come as a list of different sizes, get the largest one
-            photo = message.photo[-1]
+        elif msg.photo:
+            # Just use the largest photo size
+            photo = msg.photo[-1]
             data["media"] = {
                 "type": "photo",
-                "file_id": photo.file_id,
-                "file_unique_id": photo.file_unique_id,
                 "width": photo.width,
                 "height": photo.height,
-                "file_size": photo.file_size,
-                "sizes": [{
-                    "file_id": size.file_id,
-                    "file_unique_id": size.file_unique_id,
-                    "width": size.width,
-                    "height": size.height,
-                    "file_size": size.file_size
-                } for size in message.photo]
+                "size": photo.file_size
             }
         else:
-            data["media"] = {"type": str(message.media)}
+            data["media"] = {"type": ensure_unicode(str(msg.media))}
     
     return data
 
@@ -514,23 +520,25 @@ async def get_chat_info(
     try:
         chat_obj = await handle_chat_errors(chat, ctx, "getting chat info")
 
+        base_info = {
+            "id": chat_obj.id,
+            "type": str(chat_obj.type),
+            "username": ensure_unicode(chat_obj.username) if chat_obj.username else None
+        }
+
         if str(chat_obj.type) in ['supergroup', 'channel']:
             info = {
-                "id": chat_obj.id,
-                "title": chat_obj.title,
-                "type": str(chat_obj.type),
-                "username": chat_obj.username,
-                "description": chat_obj.description,
+                **base_info,
+                "title": ensure_unicode(chat_obj.title),
+                "description": ensure_unicode(chat_obj.description) if chat_obj.description else None,
                 "member_count": chat_obj.members_count if hasattr(chat_obj, 'members_count') else None,
                 "is_verified": chat_obj.is_verified if hasattr(chat_obj, 'is_verified') else None
             }
         else:
             info = {
-                "id": chat_obj.id,
-                "type": str(chat_obj.type),
-                "first_name": chat_obj.first_name if hasattr(chat_obj, 'first_name') else None,
-                "last_name": chat_obj.last_name if hasattr(chat_obj, 'last_name') else None,
-                "username": chat_obj.username if hasattr(chat_obj, 'username') else None
+                **base_info,
+                "first_name": ensure_unicode(chat_obj.first_name) if hasattr(chat_obj, 'first_name') else None,
+                "last_name": ensure_unicode(chat_obj.last_name) if hasattr(chat_obj, 'last_name') else None
             }
 
         return json.dumps(info, indent=2)
