@@ -63,8 +63,13 @@ asyncio_logger.setLevel(logging.DEBUG)
 
 T = TypeVar('T')
 
-async def retry_on_flood(func: Callable[..., T], *args, **kwargs) -> T:
-    """Retry a function when hitting FloodWait, with exponential backoff."""
+async def handle_flood_wait(e: FloodWait, action: str):
+    """Common handler for FloodWait errors."""
+    logger.warning(f"Hit FloodWait in {action}, waiting {e.value} seconds")
+    await asyncio.sleep(e.value)
+
+async def retry_with_flood_handling(func: Callable[..., T], action: str, *args, **kwargs) -> T:
+    """Generic retry handler for functions that may hit FloodWait."""
     max_retries = 3
     base_delay = 1
     
@@ -76,7 +81,7 @@ async def retry_on_flood(func: Callable[..., T], *args, **kwargs) -> T:
                 raise
             
             delay = e.value + (base_delay * (2 ** attempt))
-            logger.warning(f"Hit FloodWait, waiting {delay} seconds before retry {attempt + 1}/{max_retries}")
+            logger.warning(f"Hit FloodWait in {action}, waiting {delay} seconds before retry {attempt + 1}/{max_retries}")
             await asyncio.sleep(delay)
     
     return await func(*args, **kwargs)  # Final attempt
@@ -91,12 +96,9 @@ async def get_chat_history_with_retry(
     """Wrapper for get_chat_history with retry on flood."""
     messages = []
     logger.debug(f"get_chat_history_with_retry called with chat_id={chat_id}, limit={limit}, offset={offset}, offset_id={offset_id}, kwargs={kwargs}")
+    parsed_offset_id = parse_message_id(offset_id) or 0
     
-    try:
-        logger.debug("Starting first attempt at get_chat_history")
-        # Convert offset_id to int if it's a string
-        parsed_offset_id = parse_message_id(offset_id) or 0
-        
+    async def fetch_messages():
         async for msg in mcp.client.get_chat_history(
             chat_id=chat_id,
             limit=limit,
@@ -106,37 +108,18 @@ async def get_chat_history_with_retry(
         ):
             try:
                 logger.debug(f"Got message: id={msg.id}, type={type(msg)}")
-                logger.debug(f"Message attributes: {dir(msg)}")
                 messages.append(msg)
                 if len(messages) >= limit:
                     logger.debug("Reached message limit, breaking")
                     break
             except FloodWait as e:
-                logger.warning(f"Hit FloodWait in get_chat_history, waiting {e.value} seconds")
-                await asyncio.sleep(e.value)
+                await handle_flood_wait(e, "get_chat_history")
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 raise
-    except FloodWait as e:
-        logger.warning(f"Hit FloodWait starting get_chat_history, waiting {e.value} seconds")
-        await asyncio.sleep(e.value)
-        logger.debug("Starting second attempt after FloodWait")
-        async for msg in mcp.client.get_chat_history(
-            chat_id=chat_id,
-            limit=limit,
-            offset=offset,
-            offset_id=parsed_offset_id,
-            **kwargs
-        ):
-            try:
-                logger.debug(f"Got message (retry): id={msg.id}, type={type(msg)}")
-                messages.append(msg)
-                if len(messages) >= limit:
-                    logger.debug("Reached message limit (retry), breaking")
-                    break
-            except Exception as e:
-                logger.error(f"Error processing message (retry): {e}")
-                raise
+    
+    try:
+        await retry_with_flood_handling(fetch_messages, "get_chat_history")
     except Exception as e:
         logger.error(f"Error in get_chat_history: {e}, chat_id={chat_id}, limit={limit}, offset={offset}, offset_id={offset_id}, kwargs={kwargs}")
         raise
@@ -149,8 +132,7 @@ async def search_messages_with_retry(chat_id: int | str, query: str, **kwargs):
     messages = []
     logger.debug(f"search_messages_with_retry called with chat_id={chat_id}, query={query}, kwargs={kwargs}")
     
-    try:
-        logger.debug("Starting first attempt at search_messages")
+    async def fetch_messages():
         async for msg in mcp.client.search_messages(chat_id=chat_id, query=query, **kwargs):
             try:
                 logger.debug(f"Got message: id={msg.id}, type={type(msg)}")
@@ -159,25 +141,13 @@ async def search_messages_with_retry(chat_id: int | str, query: str, **kwargs):
                     logger.debug("Reached message limit, breaking")
                     break
             except FloodWait as e:
-                logger.warning(f"Hit FloodWait in search_messages, waiting {e.value} seconds")
-                await asyncio.sleep(e.value)
+                await handle_flood_wait(e, "search_messages")
             except Exception as e:
                 logger.error(f"Error processing message: {e}")
                 raise
-    except FloodWait as e:
-        logger.warning(f"Hit FloodWait starting search_messages, waiting {e.value} seconds")
-        await asyncio.sleep(e.value)
-        logger.debug("Starting second attempt after FloodWait")
-        async for msg in mcp.client.search_messages(chat_id=chat_id, query=query, **kwargs):
-            try:
-                logger.debug(f"Got message (retry): id={msg.id}, type={type(msg)}")
-                messages.append(msg)
-                if len(messages) >= kwargs.get('limit', 100):
-                    logger.debug("Reached message limit (retry), breaking")
-                    break
-            except Exception as e:
-                logger.error(f"Error processing message (retry): {e}")
-                raise
+    
+    try:
+        await retry_with_flood_handling(fetch_messages, "search_messages")
     except Exception as e:
         logger.error(f"Error in search_messages: {e}, chat_id={chat_id}, query={query}, kwargs={kwargs}")
         raise
@@ -364,6 +334,46 @@ class TelegramBridge(FastMCP):
 # Create the MCP server that the CLI will look for
 mcp = TelegramBridge()
 
+async def handle_chat_errors(chat: str, ctx: Context | None, action: str):
+    """Common error handling for chat operations.
+    
+    Args:
+        chat: Chat identifier
+        ctx: Context for error reporting
+        action: Description of the action being performed (for logging)
+    
+    Returns:
+        The resolved chat object
+        
+    Raises:
+        Various Telegram exceptions with appropriate error messages
+    """
+    try:
+        logger.debug(f"Resolving chat info for: {chat}")
+        chat_obj = await retry_with_flood_handling(mcp.client.get_chat, "get_chat", chat)
+        logger.debug(f"Chat resolved: id={chat_obj.id}, type={chat_obj.type}")
+        return chat_obj
+    except (UsernameNotOccupied, PeerIdInvalid, ChannelInvalid) as e:
+        if ctx:
+            ctx.error(f"Chat '{chat}' not found. Please check if the username/ID is correct.")
+        logger.error(f"Chat not found while {action}: {chat} - {e}")
+        raise
+    except (ChatAdminRequired, UserNotParticipant, ChannelPrivate) as e:
+        if ctx:
+            ctx.error(f"No access to chat '{chat}'. You need to join the chat first.")
+        logger.error(f"No access to chat while {action}: {chat} - {e}")
+        raise
+    except (FloodWait, SlowmodeWait) as e:
+        if ctx:
+            ctx.error(f"Rate limited. Please wait {e.value} seconds before trying again.")
+        logger.error(f"Rate limit hit while {action}: {chat} - {e}")
+        raise
+    except (UserDeactivated, UserDeactivatedBan) as e:
+        if ctx:
+            ctx.error("Your account has been deactivated or banned.")
+        logger.error(f"Account deactivated/banned while {action}: {e}")
+        raise
+
 @mcp.tool()
 async def get_messages(
     chat: str,
@@ -389,31 +399,7 @@ async def get_messages(
     logger.debug(f"Getting messages from chat: {chat} (parsed from input)")
     
     try:
-        # Get chat info first to resolve the chat
-        try:
-            logger.debug(f"Resolving chat info for: {chat}")
-            chat_obj = await retry_on_flood(mcp.client.get_chat, chat)
-            logger.debug(f"Chat resolved: id={chat_obj.id}, type={chat_obj.type}")
-        except (UsernameNotOccupied, PeerIdInvalid, ChannelInvalid) as e:
-            if ctx:
-                ctx.error(f"Chat '{chat}' not found. Please check if the username/ID is correct.")
-            logger.error(f"Chat not found: {chat} - {e}")
-            raise
-        except (ChatAdminRequired, UserNotParticipant, ChannelPrivate) as e:
-            if ctx:
-                ctx.error(f"No access to chat '{chat}'. You need to join the chat first.")
-            logger.error(f"No access to chat: {chat} - {e}")
-            raise
-        except (FloodWait, SlowmodeWait) as e:
-            if ctx:
-                ctx.error(f"Rate limited. Please wait {e.value} seconds before trying again.")
-            logger.error(f"Rate limit hit for chat {chat}: {e}")
-            raise
-        except (UserDeactivated, UserDeactivatedBan) as e:
-            if ctx:
-                ctx.error("Your account has been deactivated or banned.")
-            logger.error(f"Account deactivated/banned: {e}")
-            raise
+        chat_obj = await handle_chat_errors(chat, ctx, "getting messages")
         
         date_filter = None
         if from_date:
@@ -479,28 +465,16 @@ async def search_messages(
     for chat in chats:
         chat = parse_chat_id(chat)
         try:
-            # Get chat info first to resolve the chat
             try:
-                chat_obj = await retry_on_flood(mcp.client.get_chat, chat)
-            except (UsernameNotOccupied, PeerIdInvalid, ChannelInvalid) as e:
-                if ctx:
-                    ctx.error(f"Chat '{chat}' not found. Please check if the username/ID is correct.")
-                logger.error(f"Chat not found: {chat} - {e}")
-                continue
-            except (ChatAdminRequired, UserNotParticipant, ChannelPrivate) as e:
-                if ctx:
-                    ctx.error(f"No access to chat '{chat}'. You need to join the chat first.")
-                logger.error(f"No access to chat: {chat} - {e}")
-                continue
-            except (FloodWait, SlowmodeWait) as e:
-                if ctx:
-                    ctx.error(f"Rate limited. Please wait {e.value} seconds before trying again.")
-                logger.error(f"Rate limit hit for chat {chat}: {e}")
+                chat_obj = await handle_chat_errors(chat, ctx, "searching messages")
+            except (UsernameNotOccupied, PeerIdInvalid, ChannelInvalid,
+                    ChatAdminRequired, UserNotParticipant, ChannelPrivate,
+                    FloodWait, SlowmodeWait) as e:
+                # For search, we want to continue to next chat on most errors
+                logger.warning(f"Skipping chat {chat} due to error: {e}")
                 continue
             except (UserDeactivated, UserDeactivatedBan) as e:
-                if ctx:
-                    ctx.error("Your account has been deactivated or banned.")
-                logger.error(f"Account deactivated/banned: {e}")
+                # These are fatal errors that should stop the entire operation
                 raise
             
             # Search messages with retry
@@ -538,28 +512,7 @@ async def get_chat_info(
     chat = parse_chat_id(chat)
     
     try:
-        try:
-            chat_obj = await retry_on_flood(mcp.client.get_chat, chat)
-        except (UsernameNotOccupied, PeerIdInvalid, ChannelInvalid) as e:
-            if ctx:
-                ctx.error(f"Chat '{chat}' not found. Please check if the username/ID is correct.")
-            logger.error(f"Chat not found: {chat} - {e}")
-            raise
-        except (ChatAdminRequired, UserNotParticipant, ChannelPrivate) as e:
-            if ctx:
-                ctx.error(f"No access to chat '{chat}'. You need to join the chat first.")
-            logger.error(f"No access to chat: {chat} - {e}")
-            raise
-        except (FloodWait, SlowmodeWait) as e:
-            if ctx:
-                ctx.error(f"Rate limited. Please wait {e.value} seconds before trying again.")
-            logger.error(f"Rate limit hit for chat {chat}: {e}")
-            raise
-        except (UserDeactivated, UserDeactivatedBan) as e:
-            if ctx:
-                ctx.error("Your account has been deactivated or banned.")
-            logger.error(f"Account deactivated/banned: {e}")
-            raise
+        chat_obj = await handle_chat_errors(chat, ctx, "getting chat info")
 
         if str(chat_obj.type) in ['supergroup', 'channel']:
             info = {
