@@ -1,7 +1,24 @@
 [project]
 name = "mcp-telegram"
 version = "0.1.0"
-description = "Add your description here"
+description = "Telegram MTProto MCP server for user bot functionality"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "pyrogram>=2.0.106",
+    "tgcrypto>=1.2.5",  # Required for better performance with Pyrogram
+    "python-dotenv>=1.0.0",
+    "mcp>=1.2.1",
+    "anyio>=4.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.rye]
+managed = true
+dev-dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["mcp_telegram"]
