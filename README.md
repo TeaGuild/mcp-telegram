@@ -15,7 +15,7 @@ A Model Context Protocol (MCP) server that provides structured access to Telegra
 
 2. Clone this repository and create a `.env` file:
    ```bash
-   git clone https://github.com/yourusername/mcp-telegram.git
+   git clone https://github.com/TeaGuild/mcp-telegram.git
    cd mcp-telegram
    cp .env.example .env
    # Edit .env to add your API credentials

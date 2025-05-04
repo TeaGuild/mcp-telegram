@@ -32,9 +32,9 @@ dependencies = [
 ]
 
 [project.urls]
-Documentation = "https://github.com/yourusername/mcp-telegram/blob/main/README.md"
-Source = "https://github.com/yourusername/mcp-telegram"
-"Bug Tracker" = "https://github.com/yourusername/mcp-telegram/issues"
+Documentation = "https://github.com/TeaGuild/mcp-telegram/blob/master/README.md"
+Source = "https://github.com/TeaGuild/mcp-telegram"
+"Bug Tracker" = "https://github.com/TeaGuild/mcp-telegram/issues"
 
 [build-system]
 requires = ["hatchling"]
